@@ -1,69 +1,182 @@
 const express = require('express');
-const dotenv = require('dotenv');
-const bodyParser = require('body-parser');
 const cors = require('cors');
-const fs = require('fs');
+const bodyParser = require('body-parser');
+const admin = require('firebase-admin');
+const dotenv = require('dotenv');
+const fetch = require('node-fetch');
 
 dotenv.config();
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+// Firebase Admin init
+const serviceAccount = require('./serviceAccountKey.json');
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+const db = admin.firestore();
 
+const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-let conversations = {}; // { contactId: { name, messages: [] } }
+const VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN;
+const ACCESS_TOKEN = process.env.FB_ACCESS_TOKEN;
+const PHONE_NUMBER_ID = process.env.FB_PHONE_NUMBER_ID;
 
-app.post('/webhook', (req, res) => {
+// 🟢 Verificação do webhook
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    console.log('Webhook verificado com sucesso.');
+    return res.status(200).send(challenge);
+  } else {
+    return res.sendStatus(403);
+  }
+});
+
+// 🟢 Webhook para mensagens recebidas
+app.post('/webhook', async (req, res) => {
   const body = req.body;
-  console.log('Mensagem recebida:', JSON.stringify(body, null, 2));
 
-  if (body.object) {
-    body.entry?.forEach(entry => {
-      entry.changes?.forEach(change => {
-        const msg = change.value.messages?.[0];
-        const contact = change.value.contacts?.[0];
+  if (body.object === 'whatsapp_business_account') {
+    for (const entry of body.entry || []) {
+      const changes = entry.changes || [];
+      for (const change of changes) {
+        const value = change.value || {};
+        const messages = value.messages || [];
+        const contacts = value.contacts || [];
 
-        if (msg && contact) {
-          const id = contact.wa_id;
-          const name = contact.profile?.name || id;
+        if (messages.length > 0 && contacts.length > 0) {
+          const msg = messages[0];
+          const contact = contacts[0];
 
-          if (!conversations[id]) {
-            conversations[id] = {
-              name,
-              messages: []
-            };
-          }
+          const wa_id = contact.wa_id;
+          const nome = contact.profile?.name || wa_id;
+          const texto = msg.text?.body || '';
+          const timestamp = new Date(parseInt(msg.timestamp) * 1000);
 
-          conversations[id].messages.push({
-            from: msg.from,
-            body: msg.text?.body || '',
-            timestamp: msg.timestamp
-          });
+          // 🔵 Salva mensagem
+          await db.collection('conversas')
+            .doc(wa_id)
+            .collection('mensagens')
+            .add({
+              mensagem: texto,
+              tipo: 'recebida',
+              timestamp
+            });
+
+          // 🔵 Atualiza conversa principal
+          await db.collection('conversas')
+            .doc(wa_id)
+            .set({
+              wa_id,
+              name: nome,
+              lastMessage: texto,
+              lastTimestamp: timestamp
+            }, { merge: true });
+
+          console.log(`✅ Mensagem de ${wa_id} salva`);
         }
-      });
-    });
+      }
+    }
   }
 
   res.sendStatus(200);
 });
 
-app.get('/conversations', (req, res) => {
-  const list = Object.entries(conversations).map(([id, conv]) => ({
-    id,
-    name: conv.name,
-    lastMessage: conv.messages.at(-1)?.body || '',
-    unread: true
-  }));
-  res.json(list);
+// 🟢 Listar conversas
+app.get('/conversas', async (req, res) => {
+  try {
+    const snapshot = await db.collection('conversas')
+      .orderBy('lastTimestamp', 'desc')
+      .get();
+
+    const conversas = snapshot.docs.map(doc => ({
+      wa_id: doc.id,
+      ...doc.data()
+    }));
+
+    res.json(conversas);
+  } catch (err) {
+    console.error('Erro ao buscar conversas:', err);
+    res.status(500).send('Erro interno');
+  }
 });
 
-app.get('/conversations/:id', (req, res) => {
-  const conv = conversations[req.params.id];
-  if (!conv) return res.status(404).send('Conversation not found');
-  res.json(conv);
+// 🟢 Listar mensagens da conversa
+app.get('/conversas/:wa_id/mensagens', async (req, res) => {
+  const { wa_id } = req.params;
+
+  try {
+    const msgsSnap = await db.collection('conversas')
+      .doc(wa_id)
+      .collection('mensagens')
+      .orderBy('timestamp')
+      .get();
+
+    const mensagens = msgsSnap.docs.map(doc => doc.data());
+    res.json(mensagens);
+  } catch (err) {
+    console.error('Erro ao buscar mensagens:', err);
+    res.status(500).send('Erro interno');
+  }
 });
 
+// 🟢 Enviar mensagem
+app.post('/conversas/:wa_id/mensagens', async (req, res) => {
+  const { wa_id } = req.params;
+  const { mensagem } = req.body;
+
+  try {
+    // Envia para API da Meta
+    const resp = await fetch(`https://graph.facebook.com/v17.0/${PHONE_NUMBER_ID}/messages`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${ACCESS_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to: wa_id,
+        text: { body: mensagem }
+      })
+    });
+
+    const json = await resp.json();
+
+    if (!resp.ok) {
+      console.error('Erro ao enviar:', json);
+      return res.status(500).send(json);
+    }
+
+    const timestamp = new Date();
+
+    await db.collection('conversas')
+      .doc(wa_id)
+      .collection('mensagens')
+      .add({
+        mensagem,
+        tipo: 'enviada',
+        timestamp
+      });
+
+    await db.collection('conversas')
+      .doc(wa_id)
+      .set({
+        lastMessage: mensagem,
+        lastTimestamp: timestamp
+      }, { merge: true });
+
+    res.json({ status: 'enviada' });
+  } catch (err) {
+    console.error('Erro ao enviar mensagem:', err);
+    res.status(500).send('Erro interno');
+  }
+});
+
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Backend rodando na porta ${PORT}`);
+  console.log(`🔧 Backend rodando na porta ${PORT}`);
 });
