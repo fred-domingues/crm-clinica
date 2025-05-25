@@ -129,9 +129,12 @@ app.post('/conversas/:wa_id/mensagens', async (req, res) => {
   const { wa_id } = req.params;
   const { mensagem } = req.body;
 
+  if (!mensagem || mensagem.trim() === '') {
+    return res.status(400).json({ error: 'Mensagem inválida' });
+  }
+
   try {
-    // Envia para API da Meta
-    const resp = await fetch(`https://graph.facebook.com/v17.0/${PHONE_NUMBER_ID}/messages`, {
+    const response = await fetch(`https://graph.facebook.com/v17.0/${PHONE_NUMBER_ID}/messages`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${ACCESS_TOKEN}`,
@@ -144,35 +147,31 @@ app.post('/conversas/:wa_id/mensagens', async (req, res) => {
       })
     });
 
-    const json = await resp.json();
+    const data = await response.json();
 
-    if (!resp.ok) {
-      console.error('Erro ao enviar:', json);
-      return res.status(500).send(json);
+    if (!response.ok) {
+      console.error('❌ Falha ao enviar mensagem:', data);
+      return res.status(500).json({ error: 'Erro ao enviar para WhatsApp', details: data });
     }
 
     const timestamp = new Date();
 
-    await db.collection('conversas')
-      .doc(wa_id)
-      .collection('mensagens')
-      .add({
-        mensagem,
-        tipo: 'enviada',
-        timestamp
-      });
+    // ✅ Salva no Firestore
+    await db.collection('conversas').doc(wa_id).collection('mensagens').add({
+      mensagem,
+      tipo: 'enviada',
+      timestamp
+    });
 
-    await db.collection('conversas')
-      .doc(wa_id)
-      .set({
-        lastMessage: mensagem,
-        lastTimestamp: timestamp
-      }, { merge: true });
+    await db.collection('conversas').doc(wa_id).set({
+      lastMessage: mensagem,
+      lastTimestamp: timestamp
+    }, { merge: true });
 
-    res.json({ status: 'enviada' });
+    res.status(200).json({ status: 'mensagem enviada e salva com sucesso' });
   } catch (err) {
-    console.error('Erro ao enviar mensagem:', err);
-    res.status(500).send('Erro interno');
+    console.error('Erro interno no envio:', err);
+    res.status(500).json({ error: 'Erro interno ao enviar mensagem' });
   }
 });
 
