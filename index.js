@@ -1,44 +1,69 @@
 const express = require('express');
+const dotenv = require('dotenv');
 const bodyParser = require('body-parser');
-require('dotenv').config();
+const cors = require('cors');
+const fs = require('fs');
+
+dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 
+app.use(cors());
 app.use(bodyParser.json());
 
-app.get('/', (req, res) => {
-  res.send('Servidor CRM Clinica rodando...');
-});
+let conversations = {}; // { contactId: { name, messages: [] } }
 
-// Webhook GET (validação do Meta)
-app.get('/webhook', (req, res) => {
-  const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
-
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-
-  if (mode && token === VERIFY_TOKEN) {
-    console.log('Webhook verificado!');
-    res.status(200).send(challenge);
-  } else {
-    res.sendStatus(403);
-  }
-});
-
-// Webhook POST (recebimento de mensagens)
 app.post('/webhook', (req, res) => {
   const body = req.body;
+  console.log('Mensagem recebida:', JSON.stringify(body, null, 2));
 
   if (body.object) {
-    console.log('Mensagem recebida:', JSON.stringify(body, null, 2));
-    res.status(200).send('EVENT_RECEIVED');
-  } else {
-    res.sendStatus(404);
+    body.entry?.forEach(entry => {
+      entry.changes?.forEach(change => {
+        const msg = change.value.messages?.[0];
+        const contact = change.value.contacts?.[0];
+
+        if (msg && contact) {
+          const id = contact.wa_id;
+          const name = contact.profile?.name || id;
+
+          if (!conversations[id]) {
+            conversations[id] = {
+              name,
+              messages: []
+            };
+          }
+
+          conversations[id].messages.push({
+            from: msg.from,
+            body: msg.text?.body || '',
+            timestamp: msg.timestamp
+          });
+        }
+      });
+    });
   }
+
+  res.sendStatus(200);
+});
+
+app.get('/conversations', (req, res) => {
+  const list = Object.entries(conversations).map(([id, conv]) => ({
+    id,
+    name: conv.name,
+    lastMessage: conv.messages.at(-1)?.body || '',
+    unread: true
+  }));
+  res.json(list);
+});
+
+app.get('/conversations/:id', (req, res) => {
+  const conv = conversations[req.params.id];
+  if (!conv) return res.status(404).send('Conversation not found');
+  res.json(conv);
 });
 
 app.listen(PORT, () => {
-  console.log(`Servidor backend escutando na porta ${PORT}`);
+  console.log(`Backend rodando na porta ${PORT}`);
 });
